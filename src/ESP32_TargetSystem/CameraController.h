@@ -1,12 +1,8 @@
 #ifndef CAMERA_CONTROLLER_H
 #define CAMERA_CONTROLLER_H
-
 #include <Arduino.h>
 
-// If using ESP32-CAM:
-// #include "esp_camera.h"
 
-// Shared target struct
 struct TargetInfo {
     int x;
     int y;
@@ -15,25 +11,18 @@ struct TargetInfo {
 
 class CameraController {
 public:
-    CameraController();
-
-    // Initialize camera hardware (pins, resolution, etc.)
-    bool begin();
-
-    // Capture frame and detect a target in one shot.
-    // Returns true if a valid target was detected.
-    bool captureAndDetectTarget(TargetInfo &outTarget);
-
-    // Optional: separate steps if someone wants to expand later.
-    // bool captureFrame();
-    // bool detectTarget(TargetInfo &outTarget);
+    ~CameraController();
+    CameraController(const CameraController& obj) = delete;
+    CameraController* getInstance();
+    TargetInfo captureAndDetectTarget(float temp);
+    void testOutput();
 
 private:
-    bool initialized;
-
-    // Example of internal helper methods
+    float frame[24*32*4];
+    CameraController();
+    float* getFrame();
+    bool isConfigured;
+    static CameraController* instancePtr;
     bool configureCamera();
-    bool mockDetect(TargetInfo &outTarget);  // placeholder detection
 };
-
-#endif // CAMERA_CONTROLLER_H
+#endif 
