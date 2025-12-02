@@ -7,13 +7,13 @@
 
 
 //GPIO 22 is our output
-// GPIO 23 is our input
+// GPIO 19 is our input
 
 Servo panServo;
 Servo tiltServo;
 
 // pick actual pins you wired to the servo signal lines
-const int PAN_SERVO_PIN  = 22;
+const int PAN_SERVO_PIN  = 23;
 const int TILT_SERVO_PIN = 19;
 
  #define SERVO_TEST_MODE 1
