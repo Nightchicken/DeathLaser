@@ -1,138 +1,125 @@
 #include <Arduino.h>
-#include <ESP32Servo.h>
 #include "SystemInit.h"
 #include "CameraController.h"
 #include "LaserController.h"
 #include "StorageManager.h"
+#include "Patrol.h"
 
+// ================================================================
+// CONFIGURATION
+// ================================================================
+const int PAN_SERVO_PIN  = 25;
+const int TILT_SERVO_PIN = 26;
+const int SERIAL_BAUD    = 115200;
 
-//GPIO 22 is our output
-// GPIO 19 is our input
+// ================================================================
+// GLOBAL OBJECTS
+// ================================================================
+Patrol            patrol;            // Handles servo movement and pausing
+LaserController   laserController;   // Handles laser firing logic
+CameraController* cameraController = nullptr; // Singleton pointer
+StorageManager* storageManager   = nullptr; // Singleton pointer
 
-Servo panServo;
-Servo tiltServo;
-
-// pick actual pins you wired to the servo signal lines
-const int PAN_SERVO_PIN  = 23;
-const int TILT_SERVO_PIN = 19;
-
- #define SERVO_TEST_MODE 1
-
-void patrolServos(Servo &pan, Servo &tilt) {
-  static int panPos  = 90;
-  static int tiltPos = 90;
-  static int panDir  = 1;
-  static int tiltDir = -1;
-
-  const int MIN_ANGLE = 30;
-  const int MAX_ANGLE = 150;
-  const int STEP = 2;
-
-  panPos  += STEP * panDir;
-  tiltPos += STEP * tiltDir;
-
-  if (panPos >= MAX_ANGLE || panPos <= MIN_ANGLE) panDir *= -1;
-  if (tiltPos >= MAX_ANGLE || tiltPos <= MIN_ANGLE) tiltDir *= -1;
-
-  pan.write(panPos);
-  tilt.write(tiltPos);
-
-  delay(40);
-}
-
-
-// Global module objects
-CameraController* cameraController = nullptr;  // singleton pointer
-LaserController   laserController;
-StorageManager    storageManager;
-
+// ================================================================
+// SETUP
+// ================================================================
 void setup() {
-
-  // 1. Basic hardware/peripheral init (pins, serial, etc.)
-  SystemInit::beginSerial(115200);
+  // 1. Basic System Init
+  SystemInit::beginSerial(SERIAL_BAUD);
   SystemInit::printBanner();
 
-  // Attach servos for test
-  panServo.attach(PAN_SERVO_PIN);
-  tiltServo.attach(TILT_SERVO_PIN);
+  // 2. Initialize Storage Singleton
+  storageManager = StorageManager::getInstance();
+  if (!storageManager->begin()) {
+    Serial.println("[Error] SD Card failed or missing.");
+  } else {
+    storageManager->logEvent("System boot started.");
+  }
 
+  // 3. Initialize Patrol System
+  // This automatically attaches servos and moves them to start position
+  patrol.begin(PAN_SERVO_PIN, TILT_SERVO_PIN);
+  Serial.println("[System] Patrol initialized.");
 
-  // 2. Initialize subsystems
+  // 4. Initialize Power & GPIO
   SystemInit::initGPIO();
-  SystemInit::initCameraPower();    // OPTIONAL: if you have a camera power pin
+  SystemInit::initCameraPower();
 
-  if (!storageManager.begin()) {
-    Serial.println("[ERROR] Storage init failed.");
+  // 5. Initialize Camera Singleton
+  cameraController = CameraController::getInstance();
+  if (!cameraController) {
+    Serial.println("[CRITICAL] CameraController returned null!");
   }
 
-  // --- IMPORTANT: use getInstance() as defined in your header/cpp ---
-  // getInstance() is a NON-static member, and the ctor is private.
-  // The only way to call it without changing the header is via a pointer.
-  //
-  // This compiles and works with your implementation because getInstance()
-  // does not use `this` and only touches the static `instancePtr`.
-  // (Formally UB in C++, but it matches your class as-is.)
-  cameraController = cameraController->getInstance();
-
-  if (cameraController == nullptr) {
-    Serial.println("[ERROR] CameraController::getInstance() returned null.");
-  }
-
+  // 6. Initialize Laser Controller
   if (!laserController.begin()) {
-    Serial.println("[ERROR] Laser controller init failed.");
+    Serial.println("[Error] Laser controller init failed.");
   }
 
-  storageManager.logEvent("System setup complete.");
+  if (storageManager) storageManager->logEvent("System setup complete.");
 }
 
+// ================================================================
+// LOOP
+// ================================================================
 void loop() {
+  // 1. UPDATE PATROL
+  // This manages the servo movement AND the 5-second internal timer.
+  patrol.update();
 
-  #if SERVO_TEST_MODE
-  // Run ONLY servo patrol while testing; rest of logic is skipped.
-  patrolServos(panServo, tiltServo);
-  return;
-  #endif
+  // 2. CHECK LOCK STATE
+  // If the patrol is "locked" (paused because we saw a target), 
+  // we skip detection and just keep the signal active.
+  if (patrol.isLocked()) {
+    // Keep the laser ON to signal "I saw something"
+    laserController.fireLaser(true); 
+    
+    // Exit loop early. We don't want to detect or save new photos 
+    // while we are waiting for the 5-second timer to finish.
+    return; 
+  }
+
+  // --- If we get here, we are actively searching ---
+
+  // 3. LOOP RATE LIMITER
+  // Camera reads are slow (~60ms), so we limit the loop speed to match.
   static unsigned long lastLoopMs = 0;
   unsigned long now = millis();
-
-  // Run this logic every 50 ms (adjust as needed)
-  if (now - lastLoopMs < 50) {
-    return;
+  if (now - lastLoopMs < 60) {
+    return; 
   }
   lastLoopMs = now;
 
-  if (!cameraController) {
-    // If the singleton wasn't created, there's nothing useful to do
-    return;
-  }
+  // Safety Checks
+  if (!cameraController || !storageManager) return;
 
-  // ------------------------------------------------------------------
-  // 1. Poll camera for a target
-  // ------------------------------------------------------------------
-  // Your current API is:
-  //   TargetInfo captureAndDetectTarget(float temp);
-  //
-  // So we MUST pass a float and get a TargetInfo back.
-  // We'll use a placeholder temperature value for now.
-  float desiredTemp = 0.0f;   // TODO: decide what this should mean in your logic
-
-  TargetInfo target = cameraController->captureAndDetectTarget(desiredTemp);
-
-  // Decide whether a "real" target exists based on confidence
-  bool hasTarget = (target.confidence > 0.0f);
+  // 4. DETECT TARGET
+  TargetInfo target = cameraController->captureAndDetectTarget(0.0f);
+  
+  // 5. DECISION LOGIC
+  bool hasTarget = (target.confidence > 0.6f);
 
   if (hasTarget) {
-    // 2. Aim and fire lasers
-    laserController.setTarget(target);
-    laserController.update(true);   // true = engage
-    storageManager.saveDetection(target);
-    storageManager.logEvent("Target detected and lasers engaged.");
+    // --- TARGET ACQUIRED ---
+    
+    // A. Freeze the patrol (starts the 5-second timer inside Patrol class)
+    patrol.onTargetFound();
+
+    // B. Signal Immediately (Laser ON)
+    laserController.fireLaser(true); 
+
+    // C. Save Data & Thermal Photo (Happens once per detection event)
+    storageManager->saveDetection(target.x, target.y, target.confidence);
+    storageManager->saveThermalFrame(cameraController->getConstFrame(), 768);
+    
+    // Log it
+    String logMsg = "Target Locked. Conf: " + String(target.confidence);
+    storageManager->logEvent(logMsg);
+    Serial.println(logMsg);
+
   } else {
-    // 3. No target → make sure lasers are idle
-    laserController.update(false);  // false = disengage
+    // --- NO TARGET ---
+    // Ensure lasers are OFF while searching
+    laserController.fireLaser(false);
   }
-
-  // 4. Optional periodic housekeeping
-  storageManager.update();
 }
-
