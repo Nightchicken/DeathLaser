@@ -1,79 +1,147 @@
-#include "CameraController.h"
-#include <Wire.h> // Direct write to pins
-#include <memory> // Smart pointers
+#include "CameraController.h" 
+#include <Wire.h> 
+#include <memory>
 #include <fstream>
-#define SERIAL_DATA 0 //temp numbers
-#define SERIAL_CLOCK 0 //temp numbers
-#define I2C_DEV_ADDRES 0x33 //default number read value needs to be 128 + dev address, write value is less than 128
-#define FRAME_LENGTH_BYTES 24*32
+#include <Arduino.h> 
 
+// >>>>>> SWITCHED TO ADAFRUIT LIBRARY <<<<<<
+#include <Adafruit_MLX90640.h>
 
-CameraController* CameraController::instancePtr = nullptr;
+// Define the sensor object
+static Adafruit_MLX90640 mlx; 
+
+// =================================================================
+// 1. STATIC MEMBER INITIALIZATION
+// =================================================================
+CameraController* CameraController::instancePtr = nullptr; 
+
+// =================================================================
+// 2. CONSTRUCTOR AND DESTRUCTOR
+// =================================================================
+CameraController::CameraController(){
+    isConfigured = configureCamera();
+    if (!isConfigured) {
+        Serial.println("[Camera] Failed to configure camera.");
+    } else {
+        Serial.println("[Camera] Initialized.");
+    }
+}
 
 CameraController::~CameraController(){
-  delete instancePtr;
 }
 
-CameraController::CameraController(){
-  isConfigured = configureCamera();
-  if (!isConfigured) {
-    Serial.println("[Camera] Failed to configure camera.");
-  }
-  else{
-    Serial.println("[Camera] Initialized.");
-  }
-}
-
+// =================================================================
+// 3. SINGLETON GETTER
+// =================================================================
 CameraController* CameraController::getInstance(){
-  if (instancePtr == nullptr){
-    instancePtr = new CameraController();
-  }
-  return instancePtr;
+    if (instancePtr == nullptr){
+        instancePtr = new CameraController(); 
+    }
+    return instancePtr;
 }
 
-void CameraController::testOutput(){
-// NOTE: file output, store all the pixel data from camera frame
-  std::ofstream outputFile;
-  outputFile.open("testOutput.txt");
-  if (outputFile.is_open()){
-    outputFile << getFrame() << std::endl;
-  }
-  else{
-    Serial.println("Write to file failed");
-  }
-  outputFile.close();
-}
+// =================================================================
+// 4. CORE CAMERA METHODS (Updated for Adafruit)
+// =================================================================
 
 bool CameraController::configureCamera(){
-  Wire.begin(I2C_DEV_ADDRES);
-  return true;
+    // 1. Initialize I2C 
+    Wire.begin(); 
+    Wire.setClock(1000000); // 1 MHz clock for high FPS
+    
+    Serial.print("[Camera] Initializing MLX90640 (Adafruit Lib)...");
+    
+    // 2. Initialize Sensor (Adafruit uses begin() with address and Wire pointer)
+    if (!mlx.begin(MLX90640_I2CADDR_DEFAULT, &Wire)) {
+        Serial.println("FAILED. Check wiring!");
+        isConfigured = false;
+        return false;
+    }
+    
+    // 3. Set Refresh Rate (Adafruit uses specific enums)
+    mlx.setMode(MLX90640_CHESS); // 'Chess' mode is generally better for accuracy
+    mlx.setResolution(MLX90640_ADC_18BIT);
+    mlx.setRefreshRate(MLX90640_16_HZ);
+    
+    Serial.println("SUCCESS.");
+    isConfigured = true;
+    return true; 
 }
 
 float* CameraController::getFrame() {
-  // Request a frame worth of bytes from the I2C device
-  Wire.requestFrom(I2C_DEV_ADDRES, (uint8_t)FRAME_LENGTH_BYTES);
+    if (!isConfigured) {
+        Serial.println("[Camera] ERROR: Sensor not configured. Returning default frame.");
+        for (int i = 0; i < MLX_FRAME_SIZE; ++i) frame[i] = 20.0f; 
+        return frame;
+    }
 
-  int pixel = 0;
-  while (Wire.available() && pixel < FRAME_LENGTH_BYTES) {
-    uint8_t raw = Wire.read();        // read 1 byte
-    frame[pixel] = static_cast<float>(raw);  // store as float
-    ++pixel;                          // IMPORTANT: advance index
-  }
+    // Adafruit's getFrame takes the float array directly
+    // It returns 0 on success
+    if (mlx.getFrame(frame) != 0) {
+        Serial.println("[Camera] ERROR: Read failed.");
+        return frame; 
+    }
+    
+    // Optional: Print center temp for debug
+    // Serial.printf("[Camera] Frame captured. Center T: %.1f C\n", frame[12*32 + 16]);
 
-  // Optional delay for debugging / slow polling – you can remove or tweak this
-  delay(500);
-
-  // Return pointer to the internal buffer
-  return frame;
+    return frame;
 }
 
+const float* CameraController::getConstFrame() const {
+    return frame;
+}
 
-TargetInfo CameraController::captureAndDetectTarget(float temp){
-  // NOTE: average sensor data, return location of hotspot with that temp
-  // This function needs to be O(N^2)
-  struct TargetInfo target{};
-  if (!isConfigured) {
+void CameraController::testOutput(){
+    Serial.println("[Camera] testOutput() stub running.");
+}
+
+// =================================================================
+// 5. TARGET DETECTION (Unchanged)
+// =================================================================
+TargetInfo CameraController::captureAndDetectTarget(float desiredTemp){
+    // 1. Capture a new frame
+    float* currentFrame = getFrame();
+    
+    // 2. Normalization Setup
+    float T_min = 999.0f; 
+    float T_max = -999.0f; 
+    
+    // Find Min/Max
+    for (int i = 0; i < MLX_FRAME_SIZE; ++i) {
+        if (currentFrame[i] < T_min) T_min = currentFrame[i];
+        if (currentFrame[i] > T_max) T_max = currentFrame[i];
+    }
+    
+    float T_range = T_max - T_min;
+    if (T_range < 0.1f) T_range = 1.0f; // Prevent div by zero
+
+    // 3. Find Max Contrast
+    float normalized_detection_threshold = 0.6f; 
+    float max_normalized_value = 0.0f;
+    int hotIndex = -1;
+
+    for (int i = 0; i < MLX_FRAME_SIZE; ++i) {
+        float T_normalized = (currentFrame[i] - T_min) / T_range; 
+        
+        if (T_normalized > max_normalized_value) {
+            max_normalized_value = T_normalized;
+            hotIndex = i;
+        }
+    }
+
+    // 4. Initialize target 
+    struct TargetInfo target = {0, 0, 0.0f};
+
+    // 5. Set target if threshold met
+    if (max_normalized_value > normalized_detection_threshold) {
+        target.x = hotIndex % MLX_PIXEL_COLS;  
+        target.y = hotIndex / MLX_PIXEL_COLS;  
+        target.confidence = constrain(max_normalized_value, 0.0f, 1.0f); 
+    }
+    
+    Serial.printf("[Camera] Min:%.1f Max:%.1f Conf:%.2f @ (%d, %d)\n", 
+                  T_min, T_max, target.confidence, target.x, target.y);
+
     return target;
-  }
 }
-

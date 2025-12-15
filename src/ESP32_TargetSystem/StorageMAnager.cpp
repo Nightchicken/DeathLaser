@@ -1,74 +1,102 @@
 #include "StorageManager.h"
-#include <FS.h>
-#include <SPIFFS.h>
+#include <SD.h>
+#include <time.h> 
+#include <Arduino.h> 
 
-StorageManager::StorageManager()
-  : initialized(false)
-{
+// Initialize the static instance pointer
+StorageManager* StorageManager::instancePtr = nullptr;
+
+// =================================================================
+// 1. SINGLETON & SETUP
+// =================================================================
+StorageManager::StorageManager() {
+    sd_card_present = false;
+}
+
+StorageManager* StorageManager::getInstance() {
+    if (instancePtr == nullptr) {
+        instancePtr = new StorageManager();
+    }
+    return instancePtr;
 }
 
 bool StorageManager::begin() {
-  if (!SPIFFS.begin(true)) {
-    Serial.println("[Storage] SPIFFS mount failed.");
-    initialized = false;
-    return false;
-  }
+    Serial.printf("[Storage] Initializing SD card on CS pin %d...\n", SD_CS_PIN);
 
-  initialized = true;
-  Serial.println("[Storage] SPIFFS initialized.");
-  return true;
+    // Initialize SD card
+    if (!SD.begin(SD_CS_PIN)) {
+        Serial.println("[Storage] SD CARD FAILED, OR NOT PRESENT!");
+        sd_card_present = false;
+        return false;
+    }
+    
+    Serial.println("[Storage] SD CARD INITIALIZED.");
+    sd_card_present = true;
+    
+    // Create/Append to a main system log to confirm startup
+    logEvent("System initialized. Storage ready.");
+    return true;
 }
 
-void StorageManager::logEvent(const String &message) {
-  if (!initialized) return;
+// =================================================================
+// 2. LOGGING & DETECTIONS
+// =================================================================
+void StorageManager::logEvent(String message) {
+    if (!sd_card_present) return;
 
-  File logFile = SPIFFS.open("/events.log", FILE_APPEND);
-  if (!logFile) {
-    Serial.println("[Storage] Failed to open events.log for appending.");
-    return;
-  }
-
-  String line = getTimestamp() + " - " + message + "\n";
-  logFile.print(line);
-  logFile.close();
+    File file = SD.open("/events.log", FILE_APPEND);
+    if (file) {
+        // You can add a timestamp here if you have NTP setup
+        file.println(message);
+        file.close();
+    } else {
+        Serial.println("[Storage] Error opening events.log");
+    }
+    // Also print to Serial for debugging
+    Serial.println("[LOG] " + message);
 }
 
-bool StorageManager::saveDetection(const TargetInfo &target) {
-  if (!initialized) return false;
+void StorageManager::saveDetection(int x, int y, float confidence) {
+    if (!sd_card_present) return;
 
-  File detFile = SPIFFS.open("/detections.csv", FILE_APPEND);
-  if (!detFile) {
-    Serial.println("[Storage] Failed to open detections.csv.");
-    return false;
-  }
-
-  // Simple CSV: timestamp,x,y,confidence
-  detFile.print(getTimestamp());
-  detFile.print(",");
-  detFile.print(target.x);
-  detFile.print(",");
-  detFile.print(target.y);
-  detFile.print(",");
-  detFile.println(target.confidence);
-
-  detFile.close();
-  return true;
+    // Save to a CSV file for easy Excel/Python analysis
+    File file = SD.open("/detections.csv", FILE_APPEND);
+    if (file) {
+        // Format: Timestamp(placeholder), X, Y, Confidence
+        file.printf("%lu,%d,%d,%.2f\n", millis(), x, y, confidence);
+        file.close();
+    }
 }
 
-void StorageManager::update() {
-  if (!initialized) return;
-  // For later: rotate logs, check free space, etc.
-  rotateLogsIfNeeded();
-}
+// =================================================================
+// 3. THERMAL FRAME SAVER (NEW)
+// =================================================================
+bool StorageManager::saveThermalFrame(const float* frameData, size_t size) {
+    if (!sd_card_present) {
+        logEvent("ERROR: Cannot save frame, SD card not ready.");
+        return false;
+    }
+    
+    // Generate a unique filename based on millis() to avoid overwriting
+    // Ideally, use real time (time_t) if NTP is active.
+    char filename[32];
+    snprintf(filename, sizeof(filename), "/FRAME_%lu.txt", millis());
+    
+    File file = SD.open(filename, FILE_WRITE);
+    if (!file) {
+        logEvent("ERROR: Failed to open frame file: " + String(filename));
+        return false;
+    }
 
-String StorageManager::getTimestamp() {
-  // TODO: If you have NTP or RTC, return real time.
-  // For now, just use millis().
-  unsigned long ms = millis();
-  return String(ms);
-}
-
-void StorageManager::rotateLogsIfNeeded() {
-  // TODO: implement max-size log rotation if needed.
-  // For now, do nothing.
+    // Write all 768 temperature values
+    for (size_t i = 0; i < size; ++i) {
+        file.print(frameData[i], 2); 
+        if (i < size - 1) {
+            file.print(","); // Comma delimiter
+        }
+    }
+    
+    file.close();
+    logEvent("Saved thermal frame: " + String(filename));
+    return true;
 }
